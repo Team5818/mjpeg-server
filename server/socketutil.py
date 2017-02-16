@@ -1,7 +1,18 @@
+import struct
 import time
 from select import select
 from socket import socket, timeout
-from typing import List
+
+from typing import List, TypeVar
+
+
+def write_bytes(sock: socket, b: bytes):
+    sock.sendall(struct.pack('>I', len(b)) + b)
+
+
+def read_bytes(sock: socket) -> bytes:
+    length = struct.unpack('>I', read_or_eof(sock, 4))[0]
+    return read_or_eof(sock, length)
 
 
 def read_or_eof(sock: socket, count: int) -> bytes:
@@ -46,8 +57,18 @@ def wait_for_data(sock: socket, data: bytes, read_timeout: int = 0):
         raise TimeoutError()
 
 
-def get_readable(sockets: List[socket]) -> List[socket]:
+T = TypeVar('T')
+
+
+def get_readable(sockets: List[T]) -> List[T]:
     if not sockets:
         return []
 
     return select(sockets, (), (), 0)[0]
+
+
+def get_writeable(sockets: List[T]) -> List[T]:
+    if not sockets:
+        return []
+
+    return select((), sockets, (), 0)[1]

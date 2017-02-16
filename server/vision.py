@@ -1,50 +1,38 @@
-import os
+import multiprocessing as mp
 import time
-from multiprocessing import Condition, Value, RLock, Pipe
-from typing import Optional
+from multiprocessing import Event
+from multiprocessing.managers import Namespace, SyncManager
 
 import cv2
+from typing import Optional, Tuple
 
-from . import CaptureHTTPHandler
 from .pickle_classes import MJImage
-from .requester import RequesterServer
 
 
-def start_vision_process(comm_addr):
-    reader, writer = Pipe(duplex=False)
+def start_vision_process(manager: SyncManager) -> Tuple[Namespace, Event]:
+    ns = manager.Namespace()
+    evt = manager.Event()
+    proc = mp.Process(target=vision_starter, args=(ns, evt,))
+    proc.start()
+    return ns, evt
 
-    pid = os.fork()
-    if pid:
-        # parent
-        reader.recv()
-        reader.close()
-        print("Vision thread is now running!")
-        return pid
-    else:
-        # child
-        server = RequesterServer()
-        server.bind(comm_addr)
-        vm = VisionMain(server)
-        writer.send("running")
-        writer.close()
-        vm.run()
-        # child does not exit normally
-        return 0
+
+def vision_starter(ns: Namespace, evt: Event):
+    VisionMain(ns, evt).run()
 
 
 class VisionMain:
-    def __init__(self, requests: RequesterServer):
-        self.childs = []
-        self.requests = requests
+    def __init__(self, ns: Namespace, evt: Event):
+        self.ns = ns
+        self.evt = evt
         self.camera = cv2.VideoCapture(0)
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 600)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 400)
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 200)
 
     def run(self):
         while True:
             # noinspection PyBroadException
             try:
-                self.accept_children()
                 frame = self.get_vision_frame()
 
                 if frame:
@@ -54,12 +42,6 @@ class VisionMain:
                 traceback.print_exc()
             time.sleep(0.05)
 
-    def accept_children(self):
-        for request in self.requests.get_requests():
-            parent_comms, child_comms = Pipe()
-            fork_child(request, child_comms)
-            self.childs.append((request, parent_comms))
-
     def get_vision_frame(self) -> Optional[MJImage]:
         rc, image = self.camera.read()
         if not rc:
@@ -68,56 +50,8 @@ class VisionMain:
         return MJImage(image)
 
     def send_vision_frame(self, frame: MJImage):
-        dead = []
-        for i in range(len(self.childs)):
-            (req, writer) = self.childs[i]
-            if writer.closed:
-                dead.append(i)
-                continue
+        self.ns.image = frame
 
-            try:
-                if writer.poll(0):
-                    writer.recv()
-                    writer.send(frame)
-            except (BrokenPipeError, EOFError):
-                dead.append(i)
-
-        for i in reversed(dead):
-            del self.childs[i]
-
-
-def fork_child(request, comms):
-    val = Value('i', 0)
-    lock = RLock()
-    cond = Condition(lock)
-
-    pid = os.fork()
-    if pid:
-        # parent
-        with lock:
-            val.value = 1
-            cond.notify_all()
-            cond.wait_for(lambda: val.value == 2)
-        return pid
-    else:
-        # child
-        # noinspection PyBroadException
-        try:
-            handler = CaptureHTTPHandler(request, comms)
-            with lock:
-                cond.wait_for(lambda: val.value == 1)
-                val.value = 2
-                cond.notify_all()
-            handler.serve()
-        except Exception:
-            request.server.handle_error(request.req, request.client_address)
-            with lock:
-                cond.wait_for(lambda: val.value == 1)
-                val.value = 2
-                cond.notify_all()
-        finally:
-            request.server.shutdown_request(request.req)
-            comms.close()
-            # child does not exit normally
-            import signal
-            os.kill(os.getpid(), signal.SIGKILL)
+        if not getattr(self.ns, '_evt_set', False):
+            self.evt.set()
+            setattr(self.ns, '_evt_set', True)
